@@ -1,51 +1,69 @@
 
 on:
   push:
+    branches:
+      - master
+      - renovate/*
   pull_request:
     branches:
       - master
 
 jobs:
+  mypy:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+      with:
+        python-version: "3.13"
+    - run: pip install numpy mypy
+    - run: sudo apt-get install libsuitesparse-dev libbtbb-dev liblapack-dev libcfitsio-dev libmetis-dev libgsl-dev
+    # NB: force install to provisioned Python's PYTHONPATH
+    - run: cmake -DPython_EXECUTABLE=$(which python) -DCMAKE_INSTALL_PREFIX=$(dirname $(dirname $(which pip))) && make pyphotospline && sudo make install
+    - run: mypy test/*.py
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: mypy
     strategy:
       fail-fast: false
       matrix:
         python-version:
-          - 2.7
           - 3.8
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install numpy
+      - run: pip install numpy scipy
       - run: sudo apt-get install libsuitesparse-dev libbtbb-dev liblapack-dev libcfitsio-dev libmetis-dev libgsl-dev
       - run: cmake -DPython_EXECUTABLE=$(which python) . && make && sudo make install
       - run: python -c "import photospline"
       - run: ctest --output-on-failure
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15
+    needs: linux
     strategy:
       fail-fast: false
       matrix:
         python-version:
-          - 3.8
           - 3.9
+          - 3.12
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install numpy
+      - run: pip install numpy scipy
       - run: brew install suite-sparse cfitsio gsl
-      - run: cmake -DPython_EXECUTABLE=$(which python) . && make && make install
+      - run: cmake -DPython_EXECUTABLE=$(which python) -DCMAKE_INSTALL_PREFIX=install . && make install
       - run: python -c "import photospline"
       - run: ctest --output-on-failure
   architecture-zoo:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: linux
     strategy:
       matrix:
         include:
@@ -54,8 +72,8 @@ jobs:
           - arch: ppc64le
             distro: ubuntu20.04
     steps:
-      - uses: actions/checkout@v2
-      - uses: uraimo/run-on-arch-action@v2.0.5
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - uses: uraimo/run-on-arch-action@aa8e672a03e10b403401927ea2ceda57e1b68ac3 # v3
         with:
           arch: ${{ matrix.arch }}
           distro: ${{ matrix.distro }}
@@ -63,7 +81,7 @@ jobs:
           githubToken: ${{ github.token }}
           install: |
             apt-get update -q -y
-            apt-get install -q -y cmake clang libsuitesparse-dev libbtbb-dev liblapack-dev libcfitsio-dev libmetis-dev libgsl-dev python3-dev python3-numpy
+            apt-get install -q -y cmake clang libsuitesparse-dev libbtbb-dev liblapack-dev libcfitsio-dev libmetis-dev libgsl-dev python3-dev python3-numpy python3-scipy
           run: |
             cmake -DPython_EXECUTABLE=$(which python3) .
             make

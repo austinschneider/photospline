@@ -310,14 +310,118 @@ pysplinetable_dealloc(pysplinetable* self){
 	delete(self->table);
 }
 
+typedef std::unique_ptr<PyObject, void(*)(PyObject*)> handle;
+
+static inline handle new_reference(PyObject *ptr)
+{
+	auto deleter = [](PyObject* ptr){ Py_XDECREF(ptr); };
+	return handle(ptr, deleter);
+}
+
+static PyObject*
+pysplinetable_init_empty(pysplinetable *self){
+	try{
+		self->table=new photospline::splinetable<>();
+	}catch(std::exception& ex){
+		PyErr_SetString(PyExc_Exception,
+						(std::string("Unable to allocate spline table: ")+ex.what()).c_str());
+		return(NULL);
+	}catch(...){
+		PyErr_SetString(PyExc_Exception, "Unable to allocate spline table");
+		return(NULL);
+	}
+
+	return (PyObject*)self;
+}
+
 static PyObject*
 pysplinetable_new(PyTypeObject* type, PyObject* args, PyObject* kwds){
 	pysplinetable* self;
 
 	self = (pysplinetable*)type->tp_alloc(type, 0);
 	if(self){
+		if (pysplinetable_init_empty(self) == NULL){
+			return NULL;
+		}
+	}
+
+	return (PyObject*)self;
+}
+
+static int
+pysplinetable_init(pysplinetable* self, PyObject* args, PyObject* kwds){
+	static const char* kwlist[] = {"path", NULL};
+	PyObject *path=NULL;
+	
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&", (char**)kwlist, &PyUnicode_FSConverter, &path))
+        return -1;
+	auto handle = new_reference(path);
+	
+	try{
+		self->table=new photospline::splinetable<>(PyBytes_AsString(handle.get()));
+	}catch(std::exception& ex){
+		PyErr_SetString(PyExc_Exception,
+						(std::string("Unable to allocate spline table: ")+ex.what()).c_str());
+		return(-2);
+	}catch(...){
+		PyErr_SetString(PyExc_Exception, "Unable to allocate spline table");
+		return(-2);
+	}
+	
+    return 0;
+}
+
+static int
+extract_splinetables(PyObject *arg, std::vector<photospline::splinetable<>*> *splines);
+
+
+static int
+extract_doubles(PyObject *arg, std::vector<double> *coordinates)
+{
+	if (!PySequence_Check(arg)) {
+		PyErr_Format(PyExc_TypeError, "coordinates must be a sequence, got %R", arg);
+		return 0;
+	}
+	int fail = 0;
+	PyObject *it = PyObject_GetIter(arg);
+	PyObject *item = NULL;
+	while ((item = PyIter_Next(it)) != NULL) {
+		if (!PyNumber_Check(item)) {
+			PyErr_Format(PyExc_TypeError, "elements must be float, got %R", item);
+			fail = 1;
+		} else {
+			PyObject *value = PyNumber_Float(item);
+			coordinates->push_back(PyFloat_AsDouble(value));
+			Py_DECREF(value);
+		}
+		Py_DECREF(item);
+		if (fail) {
+			break;
+		} 
+	}
+	Py_DECREF(it);
+	return !fail;
+}
+
+static PyObject*
+pysplinetable_stack(PyTypeObject* type, PyObject* args, PyObject* kwds){
+	pysplinetable* self;
+	static const char* kwlist[] = {"tables", "coordinates", "stackOrder", NULL};
+	std::vector<photospline::splinetable<>*> splines;
+	std::vector<double> coordinates;
+	int stackOrder = 2;
+	
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&O&|i", (char**)kwlist, &extract_splinetables, &splines, &extract_doubles, &coordinates, &stackOrder)) {
+		return NULL;
+	} else if (splines.size() != coordinates.size()) {
+		PyErr_Format(PyExc_ValueError, "number of splines (%zu) does not match number of coordinates (%zu)", splines.size(),  coordinates.size());
+		return NULL;
+	}
+
+	self = (pysplinetable*)type->tp_alloc(type, 0);
+	if(self){
 		try{
-			self->table=new photospline::splinetable<>();
+			self->table=new photospline::splinetable<>(splines, coordinates, stackOrder);
 		}catch(std::exception& ex){
 			PyErr_SetString(PyExc_Exception,
 			                (std::string("Unable to allocate spline table: ")+ex.what()).c_str());
@@ -329,28 +433,6 @@ pysplinetable_new(PyTypeObject* type, PyObject* args, PyObject* kwds){
 	}
 
 	return (PyObject*)self;
-}
-
-static int
-pysplinetable_init(pysplinetable* self, PyObject* args, PyObject* kwds){
-	static const char* kwlist[] = {"path", NULL};
-	char* path=NULL;
-	
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "s", (char**)kwlist, &path))
-        return -1;
-	
-	try{
-		self->table=new photospline::splinetable<>(path);
-	}catch(std::exception& ex){
-		PyErr_SetString(PyExc_Exception,
-						(std::string("Unable to allocate spline table: ")+ex.what()).c_str());
-		return(-2);
-	}catch(...){
-		PyErr_SetString(PyExc_Exception, "Unable to allocate spline table");
-		return(-2);
-	}
-	
-    return 0;
 }
 
 static int
@@ -503,19 +585,28 @@ pysplinetable_searchcenters(pysplinetable* self, PyObject* args, PyObject* kwds)
 		return(NULL);
 	}
 	
+	bool scalar = true;
+	for(unsigned int i=0; i!=ndim; i++){
+		if (!(scalar = scalar && PyFloat_Check(new_reference(PySequence_GetItem(pyx,i)).get())))
+			break;		
+	}
+#ifndef HAVE_NUMPY
+	if (!scalar) {
+		PyErr_SetString(PyExc_ValueError, "x must be a sequence of floats");
+		return(NULL);
+	}
+#else
+	if (scalar)
+#endif
 	//unpack x
 	//assume these are arbitrary sequences, not numpy arrays
-	//TODO: should be possible to make a more efficient case for numpy arrays
 	{
 		//a small amount of evil
 		double x[ndim];
 		int centers[ndim];
 		
 		for(unsigned int i=0; i!=ndim; i++){
-			PyObject* xi=PySequence_GetItem(pyx,i);
-			x[i]=PyFloat_AsDouble(xi);
-			Py_DECREF(xi); //done with this
-			//printf("x[%u]=%lf\n",i,x[i]);
+			x[i]=PyFloat_AsDouble(new_reference(PySequence_GetItem(pyx,i)).get());
 		}
 		
 		if(!self->table->searchcenters(x,centers)){
@@ -528,6 +619,92 @@ pysplinetable_searchcenters(pysplinetable* self, PyObject* args, PyObject* kwds)
 			PyTuple_SetItem(result,i,Py_BuildValue("i",centers[i]));
 		return(result);
 	}
+#if defined(HAVE_NUMPY)
+	else
+	//optimized case for numpy arrays (or things that can be converted to them)
+	{
+		PyArrayObject* arrays[2*ndim];
+		for(unsigned int i=0; i!=ndim; i++)
+			arrays[i]=NULL;
+		npy_uint32 flags = 0;
+		npy_uint32 op_flags[2*ndim];
+		for(unsigned int i=0; i!=ndim; i++){
+			PyObject* item=PySequence_GetItem(pyx,i);
+			arrays[i] = (PyArrayObject*)PyArray_ContiguousFromAny(item, NPY_DOUBLE, 0, INT_MAX);
+			Py_DECREF(item);
+			op_flags[i] = NPY_ITER_READONLY;
+			if (arrays[i] == NULL) {
+				for (unsigned int j=0; j<i; j++)
+					Py_DECREF(arrays[i]);
+				return NULL;
+			}
+		}
+		
+		// create output array instead of using `NPY_ITER_ALLOCATE` flag
+		// to be able to return it to python
+		int nd = 2; // output array is always 2 dimensional
+		npy_intp dims[nd];
+		dims[0] = ndim;
+		dims[1] = *PyArray_DIMS(arrays[0]);
+		PyArrayObject* array_out = (PyArrayObject*)PyArray_SimpleNew(nd, dims, NPY_LONG);
+
+		for(unsigned int i=0; i!=ndim; i++){
+			// get a pointer to the data of the row
+			void* row_data = PyArray_GETPTR1(array_out, i);
+
+			// create a new 1D array that shares data with the row
+			npy_intp dims[1] = {PyArray_DIM(array_out, 1)};  // length of the row
+
+			PyArrayObject* row_array = (PyArrayObject*)PyArray_SimpleNewFromData(1, dims, NPY_LONG, row_data);
+			arrays[ndim+i] = row_array;
+
+			op_flags[ndim+i] = NPY_ITER_WRITEONLY;
+		}
+		NpyIter *iter = NpyIter_MultiNew(2*ndim, arrays, flags, NPY_KEEPORDER, NPY_NO_CASTING, op_flags, NULL);
+		if (iter == NULL){
+			for (auto ptr : arrays){
+				if(ptr)
+					Py_DECREF(ptr);
+			}
+			return NULL;
+		}
+		char** data_ptr = NpyIter_GetDataPtrArray(iter);
+		NpyIter_IterNextFunc* iternext = NpyIter_GetIterNext(iter, NULL);
+		
+		double x[ndim];
+		int centers[ndim];
+		do {
+			for (unsigned int dim=0; dim!=ndim; dim++)
+				x[dim] = *reinterpret_cast<double*>(data_ptr[dim]);
+			if(!self->table->searchcenters(x,centers)){
+				PyErr_SetString(PyExc_ValueError, "tablesearchcenters failed");
+				// clean up
+				NpyIter_Deallocate(iter);
+				for (auto ptr : arrays){
+					if(ptr)
+						Py_DECREF(ptr);
+				}
+				Py_DECREF(array_out);
+				return(NULL);
+			}
+			for(unsigned int dim=0; dim!=ndim; dim++) {
+				*reinterpret_cast<long*>(data_ptr[ndim+dim]) = centers[dim];
+			}
+		} while (iternext(iter));
+		
+		// clean up
+		for (auto ptr : arrays){
+			if(ptr)
+				Py_DECREF(ptr);
+		}
+		if (NpyIter_Deallocate(iter) != NPY_SUCCEED) {
+			Py_DECREF(array_out);
+			return NULL;
+		}
+		
+		return PyArray_Return(array_out);
+	}
+#endif
 }
 
 static PyObject*
@@ -579,7 +756,7 @@ pysplinetable_evaluate(pysplinetable* self, PyObject* args, PyObject* kwds){
 	
 	//unpack x and centers
 	//assume these are arbitrary sequences, not numpy arrays
-	//TODO: should be possible to make a more efficient case for numpy arrays
+#ifndef HAVE_NUMPY
 	{
 		//a small amount of evil
 		double x[ndim];
@@ -597,6 +774,78 @@ pysplinetable_evaluate(pysplinetable* self, PyObject* args, PyObject* kwds){
 		double result=self->table->ndsplineeval(x,centers,derivatives);
 		return(Py_BuildValue("d",result));
 	}
+#else
+	//optimized case for numpy arrays (or things that can be converted to them)
+	{
+		PyArrayObject* arrays[2*ndim+1];
+		for(unsigned int i=0; i!=2*ndim+1; i++)
+			arrays[i]=NULL;
+		npy_uint32 flags = 0;
+		npy_uint32 op_flags[2*ndim+1];
+		for(unsigned int i=0; i!=ndim; i++){
+			PyObject* item=PySequence_GetItem(pyx,i);
+			arrays[i] = (PyArrayObject*)PyArray_ContiguousFromAny(item, NPY_DOUBLE, 0, INT_MAX);
+			Py_DECREF(item);
+			op_flags[i] = NPY_ITER_READONLY;
+			if (arrays[i] == NULL) {
+				for (unsigned int j=0; j<i; j++)
+					Py_DECREF(arrays[i]);
+				return NULL;
+			}
+		}
+
+		for(unsigned int i=ndim; i!=2*ndim; i++){
+			PyObject* item=PySequence_GetItem(pycenters,i-ndim);
+			arrays[i] = (PyArrayObject*)PyArray_ContiguousFromAny(item, NPY_LONG, 0, INT_MAX);
+			Py_DECREF(item);
+			op_flags[i] = NPY_ITER_READONLY;
+			if (arrays[i] == NULL) {
+				for (unsigned int j=0; j<i; j++)
+					Py_DECREF(arrays[i]);
+				return NULL;
+			}
+		}
+
+		// allocate the output array automatically
+		op_flags[2*ndim] = NPY_ITER_WRITEONLY | NPY_ITER_ALLOCATE;
+		NpyIter *iter = NpyIter_MultiNew(2*ndim+1, arrays, flags, NPY_KEEPORDER, NPY_NO_CASTING, op_flags, NULL);
+		if (iter == NULL){
+			for (auto ptr : arrays){
+				if(ptr)
+					Py_DECREF(ptr);
+			}
+			return NULL;
+		}
+		char** data_ptr = NpyIter_GetDataPtrArray(iter);
+		NpyIter_IterNextFunc* iternext = NpyIter_GetIterNext(iter, NULL);
+		
+		double x[ndim];
+		int centers[ndim];
+		do {
+			for (unsigned int dim=0; dim!=ndim; dim++) {
+				x[dim] = *reinterpret_cast<double*>(data_ptr[dim]);
+				centers[dim] = *reinterpret_cast<int*>(data_ptr[ndim+dim]);
+			}
+			*reinterpret_cast<double*>(data_ptr[2*ndim]) = self->table->ndsplineeval(x,centers,derivatives);
+		} while (iternext(iter));
+		
+		// retrieve output array
+		PyArrayObject *out = NpyIter_GetOperandArray(iter)[2*ndim];
+		Py_INCREF(out);
+		
+		// clean up
+		for (auto ptr : arrays){
+			if(ptr)
+				Py_DECREF(ptr);
+		}
+		if (NpyIter_Deallocate(iter) != NPY_SUCCEED) {
+			Py_DECREF(out);
+			return NULL;
+		}
+		
+		return PyArray_Return(out);
+	}
+#endif
 }
 
 //attempts to do search centers and ndsplineeval in one step
@@ -858,6 +1107,9 @@ pysplinetable_deriv(pysplinetable* self, PyObject* args, PyObject* kwds){
 static PyObject*
 pyphotospline_glam_fit(PyObject* self, PyObject* args, PyObject* kwds);
 
+static PyObject*
+pyphotospline_nnls(PyObject* self, PyObject* args, PyObject* kwds);
+
 #ifdef HAVE_NUMPY
 static PyObject*
 pysplinetable_grideval(pysplinetable* self, PyObject* args, PyObject* kwds);
@@ -974,6 +1226,35 @@ pyphotospline_bspline(pysplinetable* self, PyObject* args, PyObject* kwds){
 	return PyFloat_FromDouble(photospline::bspline(knots, x, i, order));
 }
 
+static PyObject*
+pysplinetable_getstate(pysplinetable* self, PyObject *Py_UNUSED(ignored)){
+	auto buffer=self->table->write_fits_mem();
+	std::unique_ptr<void,void(*)(void*)> data(buffer.first,&free);
+	return PyBytes_FromStringAndSize((char*)buffer.first, buffer.second);
+}
+
+static PyObject*
+pysplinetable_setstate(pysplinetable* self, PyObject* state){
+    if (!PyBytes_CheckExact(state)) {
+        PyErr_SetString(PyExc_ValueError, "Pickled object is not bytes.");
+        return NULL;
+    }
+	char *buffer = PyBytes_AsString(state);
+	if (!buffer) {
+		return NULL;
+	}
+	if (!pysplinetable_init_empty(self)) {
+		return NULL;
+	}
+	try{
+		self->table->read_fits_mem(buffer, PyBytes_Size(state));
+	}catch(std::exception& ex){
+		PyErr_SetString(PyExc_Exception,ex.what());
+		return(NULL);
+	}
+
+	Py_RETURN_NONE;
+}
 
 static PyGetSetDef pysplinetable_properties[] = {
 	{(char*)"order", (getter)pysplinetable_getorder, NULL, (char*)"Order of spline in each dimension", NULL},
@@ -987,6 +1268,8 @@ static PyGetSetDef pysplinetable_properties[] = {
 };
 
 static PyMethodDef pysplinetable_methods[] = {
+	{"stack", (PyCFunction)pysplinetable_stack, METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+	 "Stack splines along the given dimension"},
 	{"write", (PyCFunction)pysplinetable_write, METH_VARARGS | METH_KEYWORDS,
 	 "Write the spline to a FITS file at the given path"},
 	{"aux_value", (PyCFunction)pysplinetable_get_aux_value, METH_VARARGS | METH_KEYWORDS,
@@ -1013,12 +1296,14 @@ static PyMethodDef pysplinetable_methods[] = {
 	 ":returns: an array of spline evaluates with size `len(coord[dim])` in each dimension"},
 #endif
 #endif
+	{"__getstate__", (PyCFunction)pysplinetable_getstate, METH_NOARGS, "Pickle the spline"},
+	{"__setstate__", (PyCFunction)pysplinetable_setstate, METH_O, "Unpickle the spline"},
 	{NULL}  /* Sentinel */
 };
 
 static PyTypeObject pysplinetableType = {
 	PyVarObject_HEAD_INIT(NULL, 0)
-	"pyphotospline.Splinetable", /*tp_name*/
+	"photospline.SplineTable", /*tp_name*/
 	sizeof(pysplinetable),     /*tp_basicsize*/
 	0,                         /*tp_itemsize*/
 	(destructor)pysplinetable_dealloc, /*tp_dealloc*/
@@ -1071,6 +1356,19 @@ static PyMethodDef photospline_methods[] = {
 	":param monodim: if specified, the fit function will be monotonic (strictly non-decreasing) along the given axis\n"
 	":param verbose: if True, will print status information to standard output while running\n"
 	":returns: a spline table object\n"},
+	{"nnls", (PyCFunction)pyphotospline_nnls, METH_VARARGS | METH_KEYWORDS,
+	 "Solve argmin_x || Ax - b ||_2 for x>=0, where A is a sparse matrix\n\n"
+	 ":param A: model matrix\n"
+	 ":param b: right-hand side vector\n"
+	 ":param tolerance: terminate once the largest element of the gradient is smaller than the tolerance\n"
+	 ":param min_iterations: minimum number of iterations (least-squares solutions in a constrained subspace) before terminating\n"
+	 ":param max_iterations: minimum number of iterations (least-squares solutions in a constrained subspace) before terminating\n"
+	 ":param npos: maximum number of positive coefficients to return\n"
+	 ":param normaleq: if True, the inputs are the normal equations At*A and At*b instead of A and b\n"
+     ":param verbose: print debugging info\n"
+	 ":returns: x, the solution vector\n\n"
+	 "This is a wrapper around a sparse implementation of Algorithm NNLS from \"Solving Least Squares Problems\", Charles Lawson and Richard Hanson. Prentice-Hall, 1974.\n"
+	 },
 #endif
 	{"bspline", (PyCFunction)pyphotospline_bspline, METH_VARARGS | METH_KEYWORDS,
 	 "Evaluate the `i`th B-spline on knot vector `knots` at `x`\n\n"
@@ -1526,4 +1824,167 @@ pysplinetable_grideval(pysplinetable* self, PyObject* args, PyObject* kwds){
 }
 #endif
 
+namespace {
+namespace detail {
+
+// A simple self-destructing wrapper around PyObject*
+struct ref {
+	static inline void decref(PyObject *x) { Py_DECREF(x); };
+	std::unique_ptr<PyObject, decltype(&decref)> px;
+	ref(PyObject *ptr) : px(ptr, &decref) {};
+	operator bool() { return bool(px); };
+	operator PyObject*() { return px.get(); };
+	PyObject* ptr() { return px.get(); }
+};
+
+}
+}
+
+static PyObject*
+pyphotospline_nnls(PyObject* self, PyObject* args, PyObject* kwds){
+	static const char* kwlist[] = {"A", "b", "tolerance", "min_iterations", "max_iterations", "npos", "normaleq", "verbose", NULL};
+
+	PyObject* py_A=NULL;
+	PyObject* py_b=NULL;
+	const char *method;
+	double tolerance=0;
+	int min_iterations=0;
+	int max_iterations=INT_MAX;
+	unsigned npos=0;
+	bool normaleq=false;
+	bool verbose=false;
+
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|diiIpp", (char**)kwlist,
+									 &py_A, &py_b, &tolerance,
+									 &min_iterations, &max_iterations, &npos, &normaleq, &verbose))
+		return(NULL);
+
+	cholmod_common cholmod_state;
+	cholmod_l_start(&cholmod_state);
+
+	// create a cholmod_sparse view into csc matrix A
+	cholmod_sparse sparse_A;
+	{
+		detail::ref sparse(PyImport_ImportModule("scipy.sparse"));
+		if (!sparse) {
+			return(NULL);
+		}
+		detail::ref isspmatrix_csc(PyObject_GetAttrString(sparse, "isspmatrix_csc"));
+		if (!isspmatrix_csc) {
+			return(NULL);
+		}
+		if (PyObject_CallFunctionObjArgs(isspmatrix_csc, py_A, NULL) != Py_True) {
+			detail::ref type(PyObject_Type(py_A));
+			detail::ref name(PyObject_GetAttrString(type, "__name__"));
+			PyErr_Format(PyExc_TypeError, "Expected scipy.sparse.csc_matrix, got %S", name.ptr());
+			return(NULL);
+		}
+	}
+	detail::ref data(
+		PyArray_FromAny(
+			detail::ref(PyObject_GetAttrString(py_A, "data")),
+			PyArray_DescrFromType(NPY_DOUBLE), 1, 1, NPY_ARRAY_C_CONTIGUOUS, NULL
+		));
+	if (!data) {
+		return(NULL);
+	}
+	detail::ref indices(
+		PyArray_FromAny(
+			detail::ref(PyObject_GetAttrString(py_A, "indices")),
+			PyArray_DescrFromType(NPY_LONGLONG), 1, 1, NPY_ARRAY_C_CONTIGUOUS, NULL
+		));
+	if (!indices) {
+		return(NULL);
+	}
+	detail::ref indptr(
+		PyArray_FromAny(
+			detail::ref(PyObject_GetAttrString(py_A, "indptr")),
+			PyArray_DescrFromType(NPY_LONGLONG), 1, 1, NPY_ARRAY_C_CONTIGUOUS, NULL
+		));
+	if (!indptr) {
+		return(NULL);
+	}
+
+	sparse_A.itype = cholmod_state.itype;
+	sparse_A.xtype = CHOLMOD_REAL;
+	sparse_A.dtype = CHOLMOD_DOUBLE;
+	sparse_A.stype = 0; // unsymmetric; all nonzero entries stored
+	sparse_A.nz = NULL; // packed storage
+	sparse_A.z = NULL; // real matrix
+	sparse_A.sorted = true;
+	sparse_A.packed = true;
+	{
+		detail::ref shape = PyObject_GetAttrString(py_A, "shape");
+		sparse_A.nrow = PyLong_AsLong(PyTuple_GetItem(shape, 0));
+		sparse_A.ncol = PyLong_AsLong(PyTuple_GetItem(shape, 1));
+	}
+	{
+		detail::ref nnz(PyObject_GetAttrString(py_A, "nnz"));
+		sparse_A.nzmax = PyLong_AsLong(nnz);
+	}
+	sparse_A.p = ExtractPyArrayDataPtr(indptr.ptr());
+	sparse_A.i = ExtractPyArrayDataPtr(indices.ptr());
+	sparse_A.x = ExtractPyArrayDataPtr(data.ptr());
+
+	// cholmod_dense view into dense matrix b
+	detail::ref array_b(PyArray_FromAny(py_b, PyArray_DescrFromType(NPY_DOUBLE), 1, 1, NPY_ARRAY_C_CONTIGUOUS, NULL));
+	cholmod_dense dense_b;
+	dense_b.xtype = CHOLMOD_REAL;
+	dense_b.dtype = CHOLMOD_DOUBLE;
+	dense_b.nzmax = PyArray_SIZE((PyArrayObject*)array_b.ptr());
+	dense_b.nrow = dense_b.nzmax;
+	dense_b.ncol = 1;
+	dense_b.d = dense_b.nrow;
+	dense_b.x = ExtractPyArrayDataPtr(array_b.ptr());
+	dense_b.z = NULL;
+
+	cholmod_dense *dense_x = nnls_lawson_hanson(&sparse_A, &dense_b,
+		tolerance,/* double tolerance */
+		min_iterations, /* unsigned min_iterations */
+		max_iterations, /* unsigned max_iterations */
+		npos, /* unsigned npos */
+		normaleq, /* int normaleq */
+		verbose, /* verbose */
+		&cholmod_state
+	);
+	npy_intp dims = dense_x->nrow;
+	PyObject *x = PyArray_SimpleNew(1, &dims, NPY_DOUBLE);
+	std::copy((double*)(dense_x->x), (double*)(dense_x->x)+dense_x->nrow, (double*)ExtractPyArrayDataPtr(x));
+
+	cholmod_l_free_dense(&dense_x, &cholmod_state);
+	cholmod_l_finish(&cholmod_state);
+
+	return x;
+}
+
 #endif //PHOTOSPLINE_INCLUDES_SPGLAM
+
+static int
+extract_splinetables(PyObject *arg, std::vector<photospline::splinetable<>*> *splines)
+{
+	if (!PySequence_Check(arg)) {
+		PyErr_Format(PyExc_TypeError, "splines must be a sequence, got %R", arg);
+		return 0;
+	}
+	if (PySequence_Length(arg) < 1) {
+		PyErr_SetString(PyExc_ValueError, "need at least 1 spline to stack");
+		return 0;
+	}
+	int fail = 0;
+	PyObject *it = PyObject_GetIter(arg);
+	PyObject *item = NULL;
+	while ((item = PyIter_Next(it)) != NULL) {
+		if (!PyObject_IsInstance(item, (PyObject*)&pysplinetableType)) {
+			PyErr_Format(PyExc_TypeError, "elements must be SplineTable, got %R", item);
+			fail = 1;
+		} else {
+			splines->push_back(((pysplinetable*)item)->table);
+		}
+		Py_DECREF(item);
+		if (fail) {
+			break;
+		} 
+	}
+	Py_DECREF(it);
+	return !fail;
+}

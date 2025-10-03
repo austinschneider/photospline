@@ -3,6 +3,7 @@
 
 #include <random>
 #include <chrono>
+#include <limits>
 
 namespace photospline{
 	
@@ -29,7 +30,13 @@ bool splinetable<Alloc>::searchcenters(const double* x, int* centers) const
 		}
 		
 		uint32_t min = order[i];
-		uint32_t max = nknots[i]-2;
+		uint32_t max = naxes[i];
+		double diff = x[i] - knots[i][min];
+		uint32_t hi = (std::numeric_limits<uint32_t>::max() < diff*rmin_sep[i] ?
+									 std::numeric_limits<uint32_t>::max() : static_cast<uint32_t>(diff*rmin_sep[i]));
+		uint32_t lo = static_cast<uint32_t>(diff*rmax_sep[i]);
+		if (hi < hi+min+1 && hi+min+1 < max) max = hi+min+1;
+		min += lo;
 		do {
 			centers[i] = (max+min)/2;
 			
@@ -665,6 +672,7 @@ splinetable<Alloc>::benchmark_evaluation(size_t trialCount, bool verbose){
 		printf("\t%.2le 'multiple' gradient evaluations/second\n",result.gradient_multi_eval_rate);
 		printf("\t(%zu trial evaluations)\n",trialCount);
 	}
+	(void)dummy;
 	
 	return(result);
 }

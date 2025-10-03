@@ -1,7 +1,14 @@
-cmake_minimum_required (VERSION 3.1.0 FATAL_ERROR)
-cmake_policy(VERSION 3.1.0)
+if (${CMAKE_VERSION} VERSION_LESS 4.0)
+  cmake_minimum_required (VERSION 3.1.0 FATAL_ERROR)
+  cmake_policy(VERSION 3.1.0)
+else()
+  # CMake 4.0 does not allow compatibility with CMake < 3.5
+  cmake_minimum_required (VERSION 4.0 FATAL_ERROR)
+  cmake_policy(VERSION 4.0)
+endif()
 
-project (photospline VERSION 2.1.0 LANGUAGES C CXX)
+
+project (photospline VERSION 2.4.1 LANGUAGES C CXX)
 
 SET(CMAKE_CXX_STANDARD 11)
 SET(CMAKE_C_STANDARD 99)
@@ -201,6 +208,10 @@ print(pl.relative_to(d))"
     OUTPUT_VARIABLE PYTHON_MODULE_DIR
     OUTPUT_STRIP_TRAILING_WHITESPACE)
   INSTALL(TARGETS pyphotospline LIBRARY DESTINATION ${PYTHON_MODULE_DIR})
+  IF(${Python_VERSION} VERSION_GREATER_EQUAL "3.9")
+    MESSAGE("-- + typing stubs")
+    INSTALL(FILES typings/photospline-stubs/__init__.pyi DESTINATION ${PYTHON_MODULE_DIR}/photospline-stubs)
+  ENDIF()
 ELSEIF(NOT PYTHON_FOUND)
   MESSAGE("-- Python not found, skipping build of python module")
 ENDIF(PYTHON_FOUND)
@@ -363,6 +374,18 @@ LIST (APPEND ALL_TESTS
   photospline-test-templated
 )
 
+if(PYTHON_FOUND AND NUMPY_FOUND)
+  ADD_TEST(photospline-test-pystack ${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/test_stack.py)
+  set_property(TEST photospline-test-pystack PROPERTY ENVIRONMENT PYTHONPATH=${PROJECT_BINARY_DIR})
+  LIST (APPEND ALL_TESTS photospline-test-pystack)
+  ADD_TEST(photospline-test-pyeval ${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/test_eval.py)
+  set_property(TEST photospline-test-pyeval PROPERTY ENVIRONMENT PYTHONPATH=${PROJECT_BINARY_DIR})
+  LIST (APPEND ALL_TESTS photospline-test-pyeval)
+  ADD_TEST(photospline-test-pickle ${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/test_pickle.py)
+  set_property(TEST photospline-test-pickle PROPERTY ENVIRONMENT PYTHONPATH=${PROJECT_BINARY_DIR})
+  LIST (APPEND ALL_TESTS photospline-test-pickle)
+endif()
+
 if(BUILD_SPGLAM)
   ADD_EXECUTABLE(photospline-test-fit
     test/test_main.cpp
@@ -381,6 +404,14 @@ if(BUILD_SPGLAM)
      WORKING_DIRECTORY ${CMAKE_BUILD_DIR}
     )
     LIST (APPEND ALL_TESTS photospline-test-pyfit)
+    if(BUILD_SPGLAM)
+      ADD_TEST(NAME photospline-test-nnls
+        COMMAND ${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/test/test_nnls.py
+        WORKING_DIRECTORY ${CMAKE_BUILD_DIR}
+      )
+      set_property(TEST photospline-test-nnls PROPERTY ENVIRONMENT PYTHONPATH=${PROJECT_BINARY_DIR})
+      LIST (APPEND ALL_TESTS photospline-test-nnls)
+    endif()
   endif()
 endif()
 
